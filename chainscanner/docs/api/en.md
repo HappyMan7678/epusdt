@@ -34,6 +34,7 @@ admin() { curl -sS -i -H "Authorization: Bearer $ADMIN" -H 'Content-Type: applic
 | Consumer | [`GET /v1/transactions/{network}/{hash}`](#transactions) | `200` |
 | Consumer | [`GET /v1/transactions/{network}/{hash}/strict`](#transactions) | `200` |
 | Administrator | [`GET /v1/admin/progress`](#scan-progress) | `200` |
+| Administrator | [`GET /v1/admin/scan-retry-rate`](#scan-retry-rate) | `200`, `400` |
 | Administrator | [`GET /v1/admin/nodes`](#list) | `200` |
 | Administrator | [`POST /v1/admin/nodes`](#add) | `201` |
 | Administrator | [`POST /v1/admin/nodes/fallback`](#fallback) | `201` |
@@ -394,6 +395,24 @@ admin -X POST "$BASE/v1/admin/nodes/fallback" --data '{"network":"base","protoco
 
 Returns one row per configured network. Reading this endpoint makes no RPC calls. `target_height` includes the configured confirmation depth. `cursor_height` is the last contiguous completed height. `lag_ms` is a lower bound on how long an observed eligible height has been waiting for that cursor. Samples are held in memory for the current watch period, at most 361 spaced at least five seconds apart. A restart starts a new observation window. Status is `warning` above 300,000 ms and `ok` otherwise. `idle`, `warming` and `stale` have null lag. A head becomes stale after five minutes or twice the poll interval, whichever is longer.
 
+`scan_success_count` and `scan_failure_count` count scan ranges completed or failed in the current uninterrupted watch period. Each range has one outcome after provider failover. Retrying a failed range later adds a new outcome. Head polls, node health probes, idle time and canceled work contribute no samples. Both counts start at zero and reset after the final watch ends or the scanner restarts. Older scanners omit both fields.
+
+<a id="scan-retry-rate"></a>
+
+### `GET /v1/admin/scan-retry-rate`
+
+Use the administrator token. Omit `network` to list configured networks, or supply one configured network. An empty, unknown or repeated network returns **400**.
+
+`total_attempts` counts provider range reads that started after the node passed the height check. `retry_attempts` counts those that reread a range or repair a gap marked failed, including fallback reads. Each attempt counts once even for a multi-height range or several RPC calls. Head probes, transaction lookups and delivery retries are excluded. Counters accumulate in memory across watch periods until the scanner restarts. `retry_rate` is `retry_attempts / total_attempts` (0–1), or `null` before the first read. To measure an interval within one run, divide the change in retries by the change in attempts.
+
+```sh
+admin "$BASE/v1/admin/scan-retry-rate?network=base"
+```
+
+```json
+[{"network":"base","total_attempts":100,"retry_attempts":4,"retry_rate":0.04}]
+```
+
 <a id="test-one"></a>
 
 ### `POST /v1/admin/nodes/{id}/test`
@@ -450,3 +469,7 @@ List returns a sorted JSON array of `{host, source}`. PUT and DELETE are idempot
 Correct invalid requests before retrying **400**. For **401**, verify the bearer token and its role. Inspect the endpoint-specific meaning of **409** above. A **503** indicates that the subscription, queue, cursor or node store could not serve the operation. Retry transient failures with backoff. An empty queue returns **204**.
 
 [Guide](../../README.md) · [ConsumerHandler](https://github.com/GMWalletApp/ChainScanner/blob/main/internal/feed/handler.go) · [NodeRegistry.Handler](https://github.com/GMWalletApp/ChainScanner/blob/main/internal/nodes/http.go)
+
+### Node management capabilities
+
+`GET /v1/admin/capabilities` lists the available protocols and reports support for node settings and migration. Use `PATCH /v1/admin/nodes/{id}` with any of `enabled`, `role`, `purpose`, `weight`, `url`, `api_key`, `history_url` and `history_api_key`. Omitted settings retain their values. The role is either `regular` or `fallback`. Disabling a node preserves its settings across restarts and discovery. Set `purpose` to `manual_verify` to reserve a regular node for manual verification. An explicit manual strict lookup accepts `manual=true`. Batch health checks skip disabled nodes and accept `include_manual=true` to include manual-only nodes.
