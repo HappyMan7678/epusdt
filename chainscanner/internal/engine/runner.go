@@ -117,18 +117,42 @@ func (s *Store) step(ctx context.Context, n chains.Network, source chains.Source
 	}
 	completed := 0
 	var unavailable error
-	finish := func(span chains.Span, link chains.BlockLink, events []chains.Activity, readErr error) error {
+	finish := func(span chains.Span, link chains.BlockLink, events []chains.Activity, readErr error) (finishErr error) {
 		s.demandMu.Lock()
 		defer s.demandMu.Unlock()
-		if s.periodLocked(n.Name).active != period {
+		p := s.periodLocked(n.Name)
+		if p.active != period {
 			return context.Canceled
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// A fork rejected at commit can still be retried on another node.
+		// Count the terminal range result once, after any local validation and commit.
+		defer func() {
+			if p.active != period || ctx.Err() != nil || errors.Is(readErr, context.Canceled) || errors.Is(finishErr, context.Canceled) {
+				return
+			}
+			switch {
+			case readErr == nil && finishErr == nil:
+				p.scanSuccessCount++
+			case readErr != nil || !errors.Is(finishErr, chains.ErrFork):
+				p.scanFailureCount++
+			}
+		}()
 		if readErr != nil {
 			unavailable = readErr
 			return s.deferGap(ctx, n.Name, span)
 		}
+		var sourceIDs []string
+		if len(events) != 0 {
+			sourceIDs = chains.SourceIDs(n)
+		}
 		for i := range events {
 			e := &events[i]
+			if len(e.ScanSources) == 0 {
+				e.ScanSources = sourceIDs
+			}
 			if e.Height < span.First || e.Height > span.Last || (e.Network != "" && e.Network != n.Name) {
 				return errors.New("event outside assigned range")
 			}
