@@ -32,8 +32,8 @@ admin() { curl -sS -i -H "Authorization: Bearer $ADMIN" -H 'Content-Type: applic
 | 消费者 | [`POST /v1/events/{id}/ack`](#ack) | `204` |
 | 消费者 | [`GET /v1/heights/{network}`](#height) | `200` |
 | 消费者 | [`GET /v1/transactions/{network}/{hash}`](#transactions) | `200` |
-| 消费者 | [`GET /v1/transactions/{network}/{hash}/strict`](#transactions) | `200` |
 | 管理员 | [`GET /v1/admin/progress`](#scan-progress) | `200` |
+| 管理员 | [`GET /v1/admin/scan-retry-rate`](#scan-retry-rate) | `200`, `400` |
 | 管理员 | [`GET /v1/admin/nodes`](#list) | `200` |
 | 管理员 | [`POST /v1/admin/nodes`](#add) | `201` |
 | 管理员 | [`POST /v1/admin/nodes/fallback`](#fallback) | `201` |
@@ -48,33 +48,28 @@ admin() { curl -sS -i -H "Authorization: Bearer $ADMIN" -H 'Content-Type: applic
 
 ## 按哈希查询交易
 
-使用消费者令牌，指定已配置的网络，无需订阅地址。成功响应包含 `network`、规范化后的 `hash` 和链原生数据 `result`。EVM 和 TRON 返回交易及回执，EVM 待打包交易的回执可为 null。
+使用消费者令牌，指定已配置的网络，无需订阅地址。成功响应包含 `network`、规范化后的 `hash` 和链原生数据 `result`。EVM 和 TRON 返回交易及回执。
 
-普通查询随机选择一个空闲节点，优先使用已有健康记录的节点。严格查询每轮只向两个不同节点并发请求。两份完整交易结果一致就返回，否则换两个未使用的节点重试一次。报错和查无交易均不计票。比较时忽略 JSON 对象键顺序与空白，保留字段值、数组顺序和大整数精度。
+Bitcoin 主网键为 `bitcoin`，哈希使用 64 位十六进制 txid。已入块交易返回 `result.txid`、完整序列化交易 `result.hex` 及 `result.blockhash`，未入块交易视为 `pending`。扫描事件的 `activity.data.transaction` 包含按块取得的交易和前序输出，`activity.data.block_hash` 标明区块。
 
-同一条链可配置两个独立运营商的兜底节点，每个节点单独登记一次。失败区块在符合高度要求的兜底节点间轮询补扫。严格查询优先让两个可用的兜底节点同时核验；仅有一个可用时，默认可由普通节点补足另一票。普通查询跳过兜底节点，两种查询都跳过冷却节点。 缺少近期健康记录的节点先查高度，再接收交易哈希。同链、同主机和端口的别名或共享历史接口只算一个节点，不同域名仍可能属于同一运营商。每轮选节点最多 4 秒，并发查交易最多 9 秒。400 表示参数无效，401 表示鉴权失败，404 表示普通查询未找到交易，502 表示查询失败或两轮均未达成一致，503 表示可用节点不足或节点列表不可用。失败响应不含交易数据。
+按哈希查询优先使用兜底节点，取得可用交易内容即返回。Scanner 排除曾经扫到这笔订阅交易的节点。
 
-TON 先用 v3 索引定位交易，再由两个主机和公钥均不同的直连 ADNL LiteServer 分别验证交易包含证明。返回的核验结果包含交易 BOC、交易哈希、账户、逻辑时间、时间戳，以及分片和主链区块根哈希。无法组成证明节点对时，也可由两个独立的 v3 索引核对完整记录。全局配置 URL 不能充当直连证明节点。 需要持久化尝试次数的客户端可使用 `?rounds=1`，第二轮通过 `X-ChainScanner-Exclude` 回传首轮响应的 `X-ChainScanner-Pair`，排除已用节点。默认接口自行完成两轮。
+HTTP 404 且响应头为 `X-ChainScanner-Evidence: not_found` 表示节点明确返回查无该交易，支付系统可挂起订单。遇到 502 或 503 时保持确认中，延迟后继续查询。响应头也可能标记 `pending` 或 `incomplete`。
+
+查询失败时轮换可用节点。在请求时限内有其他节点可用时，首次失败后至少重试三次。`?fallback_only=true` 限定只用兜底节点。`?observed=true` 要求 Scanner 有这笔订阅交易的扫块来源记录。缺少来源记录或没有可供复查的节点时返回 503，订单继续等待。
 
 ```sh
 consumer "$BASE/v1/transactions/base/$TX_HASH"
-consumer "$BASE/v1/transactions/base/$TX_HASH/strict"
-consumer "$BASE/v1/transactions/base/$TX_HASH/strict?fallback_only=true"
+consumer "$BASE/v1/transactions/base/$TX_HASH?fallback_only=true"
 ```
 
 <a id="trust"></a>
 
 ### 什么时候需要二次确认
 
-公共节点会轮换。订阅事件和普通查询可能收到滞后、错误甚至伪造的数据，目前没有可核实的历史发生率。涉及入账或发货时，建议用交易哈希调用 `/strict` 二次确认，再核对交易是否成功、收款地址、资产、金额和确认深度。两个节点结果一致可提高可信度，不同域名仍可能属于同一运营商。
-
-建议选择一家你信任、且与普通节点分属不同运营商的服务商，把它配置为兜底节点，用于补扫失败区块和严格查询。低频业务可先用免费额度，再按补扫量、查询量和供应商各方法的计费方式核算。 [API](#fallback)
-
-默认严格接口两轮耗尽时，响应带有 `X-ChainScanner-Manual-Review: required`。支付系统应停止对本笔交易自动重试，保存网络与哈希，交由人工复核。`X-ChainScanner-Strict-Rounds` 表示本次已尝试的轮数。
+入账前应核对交易执行状态、确认深度、收款地址、币种和金额。查询结果来自本次选中的 RPC 节点。
 
 [节点黑名单](#blacklist)
-
-严格接口加上 `?fallback_only=true` 可限定所有上游请求只用兜底节点。重试须换两个未用过的节点；若只有首轮那一对，返回 503。TON 的证明查询还需要 v3 索引定位交易，仅兜底模式下也要把定位索引登记为兜底，或配置两个独立的 v3 兜底索引直接核对。v3 索引只用于查询，不能补扫区块。 在 TON 上，如果配置的兜底 LiteServer 不足两个，可优先由两个独立的兜底 v3 索引核对完整交易记录。
 
 <a id="subscriptions"></a>
 
@@ -148,6 +143,7 @@ consumer "$BASE/v1/events/next?network=base&wait=15"
 | `activity.confirmations, activity.time_ms` | `int64, int64` | 观察到的确认数、链上时间戳（Unix 毫秒）。 |
 | `activity.addresses` | `string[]` | 该消费者本次匹配到的监听地址。 |
 | `activity.data` | `JSON` | 链专属 JSON 证据。EVM 数据可包含 `transaction`、`logs`、`receipt`、`trace`。 |
+| `activity.data.refresh_assets` | `string[]` | 识别到全局余额调整时，列出需要刷新的代币合约；为空时省略。 [EVM](../guide/zh-CN.md#asset-events) |
 
 <a id="ack"></a>
 
@@ -381,7 +377,7 @@ admin -X POST "$BASE/v1/admin/nodes" --data '{"network":"base","protocol":"http"
 
 ### `POST /v1/admin/nodes/fallback`
 
-使用管理员令牌为指定链登记付费历史节点，参数与普通节点相同。成功返回 **201**，节点的 `origin` 为 `fallback`。普通节点读块失败后，空闲的兜底节点可立即接手该区间；已记录到 SQLite 的缺块在重启后也可用它补扫。补扫前会核对该节点自身的高度与确认数。新块首扫、订阅边界查询和日常链头轮询均使用普通节点。管理员主动测试（含批量测试）会请求付费节点。补扫再次失败会保留缺块，节点同样遵循连续三次失败后的阶梯冷却。可用返回的节点 ID 查询列表、测试或删除。 同一条链可配置两个独立运营商的兜底节点，每个节点单独登记一次。失败区块在符合高度要求的兜底节点间轮询补扫。严格查询优先让两个可用的兜底节点同时核验；仅有一个可用时，默认可由普通节点补足另一票。普通查询跳过兜底节点，两种查询都跳过冷却节点。
+使用管理员令牌为指定链登记付费历史节点，参数与普通节点相同。成功返回 **201**，节点的 `origin` 为 `fallback`。普通节点读块失败后，空闲的兜底节点可立即接手该区间；已记录到 SQLite 的缺块在重启后也可用它补扫。补扫前会核对该节点自身的高度与确认数。新块首扫、订阅边界查询和日常链头轮询均使用普通节点。管理员主动测试（含批量测试）会请求付费节点。补扫再次失败会保留缺块，节点同样遵循连续三次失败后的阶梯冷却。可用返回的节点 ID 查询列表、测试或删除。
 
 ```sh
 admin -X POST "$BASE/v1/admin/nodes/fallback" --data '{"network":"base","protocol":"http","url":"https://paid-rpc.example.org","api_key":"YOUR_PROVIDER_KEY"}'
@@ -393,6 +389,24 @@ admin -X POST "$BASE/v1/admin/nodes/fallback" --data '{"network":"base","protoco
 ### `GET /v1/admin/progress`
 
 每条已配置网络返回一行。查看进度只读现有数据。`target_height` 是满足确认深度的目标高度，`cursor_height` 是连续扫完的高度。`lag_ms` 表示扫描器首次观测到尚未连续扫完的目标后，至少经过了多少毫秒。每个监听周期最多保留 361 个间隔至少 5 秒的样本，重启后重新观测。超过 300,000 毫秒为 `warning`，否则为 `ok`。无订阅 `idle`、等待样本 `warming`、链头过期 `stale` 时延迟为 null。链头过期阈值取 5 分钟和两个轮询周期中的较长者。
+
+`scan_success_count` 和 `scan_failure_count` 分别表示本次连续监听期间成功和失败的扫块区段次数。节点切换重试后每个区段只计一次结果，后续重新调度补扫会再计一次。高度查询、节点健康检查、空闲和取消均不计入。两个计数从零开始，在最后一个订阅结束或服务重启后归零。旧版服务省略这两个字段。
+
+<a id="scan-retry-rate"></a>
+
+### `GET /v1/admin/scan-retry-rate`
+
+使用管理员令牌。省略 `network` 返回所有已配置网络，传一个网络名可单独查询。网络名为空、未配置或重复传参返回 **400**。
+
+`total_attempts` 统计节点通过高度检查后实际开始的扫块区间读取次数。`retry_attempts` 统计其中的重读次数，包括换节点重读和对已标记失败区间的补扫。一次区间读取计一次，即使覆盖多个高度或调用多次 RPC。链头探测、按哈希查交易及通知重投均不计入。计数在内存中跨监听周期累积，服务重启后归零。`retry_rate` 等于重试次数除以总尝试次数，范围为 0 到 1，尚无读取时为 `null`。要统计同一次运行内某段时间的重试率，可用两次查询之间的重试增量除以总尝试增量。
+
+```sh
+admin "$BASE/v1/admin/scan-retry-rate?network=base"
+```
+
+```json
+[{"network":"base","total_attempts":100,"retry_attempts":4,"retry_rate":0.04}]
+```
 
 <a id="test-one"></a>
 
@@ -450,3 +464,7 @@ admin -X DELETE "$BASE/v1/admin/blacklist/exact:rpc.example.org"
 遇到 **400** 先修正参数；**401** 时检查 Bearer 令牌及角色。**409** 的含义随接口而异，见各接口说明。**503** 表示订阅、队列、游标或节点存储暂时无法完成操作，可退避重试。空队列返回 **204**。
 
 [使用指南](../../README.zh-CN.md) · [ConsumerHandler](https://github.com/GMWalletApp/ChainScanner/blob/main/internal/feed/handler.go) · [NodeRegistry.Handler](https://github.com/GMWalletApp/ChainScanner/blob/main/internal/nodes/http.go)
+
+### 节点管理能力
+
+通过 `GET /v1/admin/capabilities` 查询支持的协议及节点配置和迁移能力。`PATCH /v1/admin/nodes/{id}` 支持修改 `enabled`、`role`、`purpose`、`weight`、`url`、`api_key`、`history_url` 和 `history_api_key`。省略的字段保留原值。角色分为普通节点（regular）和兜底节点（fallback）。停用的节点保留原配置，重启和重新发现后仍然停用。普通节点可以设置为补单专用（manual_verify）。人工严格验单使用 `manual=true`。批量健康检查跳过停用节点，传入 `include_manual=true` 可包含补单专用节点。

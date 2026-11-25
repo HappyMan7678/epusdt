@@ -21,6 +21,7 @@ const (
 // SourcePool is owned by one scan loop. SetNodes, Head, Read and Close must be
 // called serially. Independent nodes within a Read are used concurrently.
 type SourcePool struct {
+	scanAttempts   *scanAttempts
 	lanes          *providerLanes
 	live           *liveQueue
 	uses           uint64
@@ -41,6 +42,7 @@ type SourcePool struct {
 }
 
 type endpoint struct {
+	weight, picks              int
 	fallback                   bool // operator-funded history endpoint; failed ranges only
 	lastUse                    uint64
 	measured, accepted         headSample
@@ -246,7 +248,7 @@ func (p *SourcePool) record(n *endpoint, read bool, err error) {
 	}
 }
 func (p *SourcePool) height(ctx context.Context, n *endpoint) (height int64, resultErr error) {
-	defer p.lanes.scan(providerKey(n.cfg))()
+	defer p.lanes.scan(chains.ProviderKey(n.cfg))()
 	return p.readHeight(ctx, n)
 }
 func (p *SourcePool) readHeight(ctx context.Context, n *endpoint) (height int64, resultErr error) {

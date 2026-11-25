@@ -10,6 +10,7 @@ import (
 )
 
 type segment struct {
+	readStarted                 bool // this work item has already entered a block read
 	behind                      map[*endpoint]bool
 	from, to                    int64
 	running, done               bool
@@ -25,7 +26,7 @@ type segment struct {
 func (p *SourcePool) fetch(ctx context.Context, n *endpoint, j *segment, oneRead bool) error {
 	call, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	defer p.lanes.scan(providerKey(n.cfg))()
+	defer p.lanes.scan(chains.ProviderKey(n.cfg))()
 	required := j.to + max(n.cfg.Confirmations-1, 0)
 	if n.tip < required || n.src == nil {
 		h, err := p.readHeight(call, n)
@@ -36,6 +37,10 @@ func (p *SourcePool) fetch(ctx context.Context, n *endpoint, j *segment, oneRead
 			return errNodeBehind
 		}
 	}
+	// Count a provider's range read only after its head is eligible. A single
+	// attempt may require several RPCs to read the range.
+	p.scanAttempts.record(j.readStarted)
+	j.readStarted = true
 	j.events = nil
 	j.first, j.last = chains.BlockLink{}, chains.BlockLink{}
 	for start := j.from; start <= j.to; {
@@ -50,6 +55,12 @@ func (p *SourcePool) fetch(ctx context.Context, n *endpoint, j *segment, oneRead
 		}
 		j.last = link
 		end := part.Last
+		if len(rows) > 0 {
+			sources := chains.SourceIDs(n.cfg)
+			for i := range rows {
+				rows[i].ScanSources = sources
+			}
+		}
 		j.events = append(j.events, rows...)
 		if oneRead {
 			j.to = end
@@ -171,6 +182,13 @@ func (p *SourcePool) pickRole(last int64, busy map[string]bool, excluded func(*e
 	if selected < 0 {
 		return nil, waiting
 	}
-	*cursor = (selected + 1) % len(p.nodes)
+	n := p.nodes[selected]
+	n.picks++
+	if n.picks >= max(1, n.weight) {
+		n.picks = 0
+		*cursor = (selected + 1) % len(p.nodes)
+	} else {
+		*cursor = selected
+	}
 	return p.nodes[selected], waiting
 }

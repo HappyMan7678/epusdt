@@ -18,6 +18,11 @@ import (
 type Node struct {
 	ID int64 `json:"id"`
 	NodeEndpoint
+	Enabled     bool   `json:"enabled"`
+	Weight      int    `json:"weight"`
+	Purpose     string `json:"purpose"`
+	Role        string `json:"role"`
+	managed     bool
 	Origin      string `json:"origin"`
 	Status      string `json:"status"`
 	ReadFailure string `json:"read_failure,omitempty"`
@@ -34,12 +39,16 @@ type Node struct {
 // NodeOptions accepts the same credentials and companion endpoint as a network configuration.
 type NodeOptions struct {
 	NodeEndpoint
+	Enabled       *bool  `json:"enabled,omitempty"`
+	Weight        int    `json:"weight,omitempty"`
+	Purpose       string `json:"purpose,omitempty"`
 	APIKey        string `json:"api_key,omitempty"`
 	HistoryURL    string `json:"history_url,omitempty"`
 	HistoryAPIKey string `json:"history_api_key,omitempty"`
 }
 
 type NodeRegistry struct {
+	scanAttempts map[string]*scanAttempts // fixed at startup, one counter per configured network
 	blacklist    hostBlacklist
 	lookup       transactionLookup
 	db           *sql.DB
@@ -48,6 +57,8 @@ type NodeRegistry struct {
 	configured   map[NodeEndpoint]chains.Network
 	slots        chan struct{}
 	batch        sync.Mutex
+	watchMu      sync.Mutex
+	changes      map[string]chan struct{}
 	revision     atomic.Uint64
 	readFailures sync.Map // nodeVersion -> readFailure for the active watch period
 }
@@ -58,6 +69,7 @@ func NewNodeRegistry(ctx context.Context, s *engine.Store, networks []chains.Net
 		return nil, err
 	}
 	r := &NodeRegistry{store: s, db: engine.Database(s), builtins: map[NodeEndpoint]NodeEndpoint{}, configured: map[NodeEndpoint]chains.Network{}, slots: make(chan struct{}, 8)}
+	r.scanAttempts = make(map[string]*scanAttempts, len(networks))
 	enabled := map[string]chains.Network{}
 	for _, n := range networks {
 		if !chains.Supported(n.Name) {
@@ -66,7 +78,11 @@ func NewNodeRegistry(ctx context.Context, s *engine.Store, networks []chains.Net
 		if _, ok := enabled[n.Name]; ok {
 			return nil, errors.New("duplicate network")
 		}
+		if err := n.ValidateAssetEvents(); err != nil {
+			return nil, err
+		}
 		enabled[n.Name] = n
+		r.scanAttempts[n.Name] = new(scanAttempts)
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -79,6 +95,9 @@ func NewNodeRegistry(ctx context.Context, s *engine.Store, networks []chains.Net
 	origin TEXT NOT NULL, removed INTEGER NOT NULL DEFAULT 0, height INTEGER, checked_at INTEGER,
 	latency INTEGER, generation INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'untested', UNIQUE(network,protocol,url))`)
 	if err != nil {
+		return nil, err
+	}
+	if err := upgradeNodeSettings(ctx, tx); err != nil {
 		return nil, err
 	}
 	if err := r.blacklist.load(ctx, tx, blocked); err != nil {
@@ -117,7 +136,7 @@ func NewNodeRegistry(ctx context.Context, s *engine.Store, networks []chains.Net
 	// automatic entries left over from a previous catalog.
 	for key := range retiredEndpoints {
 		for _, row := range existing[key] {
-			if row.removed || (row.origin != "builtin" && !isDiscoveryOrigin(row.origin)) {
+			if row.removed || row.managed || (row.origin != "builtin" && !isDiscoveryOrigin(row.origin)) {
 				continue
 			}
 			if _, err := tx.ExecContext(ctx, "DELETE FROM rpc_nodes WHERE id=?", row.id); err != nil {
@@ -144,12 +163,12 @@ func NewNodeRegistry(ctx context.Context, s *engine.Store, networks []chains.Net
 }
 
 const seedNode = `INSERT INTO rpc_nodes(network,protocol,url,origin) VALUES(?,?,?,?)
-ON CONFLICT(network,protocol,url) DO UPDATE SET origin=excluded.origin WHERE origin IN ('chainlist','openchainbench','comparenodes') OR (origin='config' AND excluded.origin='builtin')`
-const nodeFields = `id,network,protocol,url,origin,status,height,checked_at,latency,generation,api_key,history_url,history_key`
+ON CONFLICT(network,protocol,url) DO UPDATE SET origin=excluded.origin WHERE managed=0 AND (origin IN ('chainlist','openchainbench','comparenodes') OR (origin='config' AND excluded.origin='builtin'))`
+const nodeFields = `id,network,protocol,url,origin,status,height,checked_at,latency,generation,api_key,history_url,history_key,enabled,weight,purpose,role,managed`
 
 func (r *NodeRegistry) scan(row interface{ Scan(...any) error }) (Node, error) {
 	var n Node
-	err := row.Scan(&n.ID, &n.Network, &n.Protocol, &n.URL, &n.Origin, &n.Status, &n.Height, &n.CheckedAt, &n.Latency, &n.generation, &n.options.APIKey, &n.options.HistoryURL, &n.options.HistoryAPIKey)
+	err := row.Scan(&n.ID, &n.Network, &n.Protocol, &n.URL, &n.Origin, &n.Status, &n.Height, &n.CheckedAt, &n.Latency, &n.generation, &n.options.APIKey, &n.options.HistoryURL, &n.options.HistoryAPIKey, &n.Enabled, &n.Weight, &n.Purpose, &n.Role, &n.managed)
 	if data, ok := r.readFailures.Load(n.version()); ok {
 		f := data.(readFailure)
 		n.Status, n.ReadFailure = "unavailable", f.reason
@@ -157,7 +176,7 @@ func (r *NodeRegistry) scan(row interface{ Scan(...any) error }) (Node, error) {
 			n.ReadRetryAt = f.retry.UnixMilli()
 		}
 	}
-	n.Scannable = n.Protocol != "toncenter-v3" && chains.Supported(n.Network) && !slices.Contains(heightOnlyNodes, n.NodeEndpoint.identity())
+	n.Scannable = n.Protocol != "unisat" && n.Protocol != "toncenter-v3" && chains.Supported(n.Network) && !slices.Contains(heightOnlyNodes, n.NodeEndpoint.identity())
 	switch {
 	case n.Protocol == "sse":
 		n.HeightUnit = "beacon_slot"
@@ -204,10 +223,13 @@ func (r *NodeRegistry) visible(n Node) bool {
 			return false
 		}
 	}
-	if n.Network != "bitcoin" && !chains.Supported(n.Network) {
+	if !chains.Supported(n.Network) {
 		return false
 	}
 	_, configured := r.configured[n.NodeEndpoint]
+	if n.managed {
+		return true
+	}
 	if n.Origin == "builtin" && !configured {
 		_, ok := r.builtins[n.NodeEndpoint]
 		return ok
@@ -230,37 +252,65 @@ func (r *NodeRegistry) Add(ctx context.Context, options NodeOptions) (Node, erro
 }
 
 func (r *NodeRegistry) add(ctx context.Context, options NodeOptions, fallback bool) (Node, error) {
+	return r.insert(ctx, options, fallback, false)
+}
+func (r *NodeRegistry) validate(options NodeOptions, fallback bool) (NodeEndpoint, error) {
+	if options.Weight < 1 || (options.Purpose != "general" && options.Purpose != "manual_verify" && options.Purpose != "both") || (fallback && options.Purpose == "manual_verify") {
+		return NodeEndpoint{}, errInvalidNode
+	}
+	if fallback && !chains.Supported(options.Network) {
+		return NodeEndpoint{}, errInvalidNode
+	}
+	if fallback && options.Network == "bitcoin" && options.Protocol == "unisat" {
+		return NodeEndpoint{}, errInvalidNode
+	}
+	if blocked := r.blacklist.hosts(); blocked.matches(strings.TrimSpace(options.URL)) || blocked.matches(options.HistoryURL) {
+		return NodeEndpoint{}, errInvalidNode
+	}
+	return options.ValidatedEndpoint()
+}
+
+// ValidatedEndpoint checks the primary and history transports, including height-only interfaces.
+func (options NodeOptions) ValidatedEndpoint() (NodeEndpoint, error) {
 	e := options.NodeEndpoint
-	origin := "custom"
-	if fallback {
-		if !chains.Supported(e.Network) {
-			return Node{}, errInvalidNode
-		}
-		origin = "fallback"
-	}
 	e.URL = strings.TrimSpace(e.URL)
-	if blocked := r.blacklist.hosts(); blocked.matches(e.URL) || blocked.matches(options.HistoryURL) {
-		return Node{}, errInvalidNode
-	}
 	u, err := url.Parse(e.URL)
 	if err != nil || u.User != nil || u.Fragment != "" || len(e.URL) > 4096 {
-		return Node{}, errInvalidNode
+		return NodeEndpoint{}, errInvalidNode
 	}
 	if e.Network == "ton" && e.Protocol == "toncenter-v3" {
 		if u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") || options.HistoryURL != "" || options.HistoryAPIKey != "" {
-			return Node{}, errInvalidNode
+			return NodeEndpoint{}, errInvalidNode
 		}
-	} else if e.Network == "bitcoin" {
-		if u.Hostname() == "" || options.HistoryURL != "" || options.HistoryAPIKey != "" || (e.Protocol != "unisat" && e.Protocol != "jsonrpc") || (u.Scheme != "https" && u.Scheme != "http") {
-			return Node{}, errInvalidNode
+	} else if e.Network == "bitcoin" && e.Protocol == "unisat" {
+		if u.Hostname() == "" || options.HistoryURL != "" || options.HistoryAPIKey != "" || (u.Scheme != "https" && u.Scheme != "http") {
+			return NodeEndpoint{}, errInvalidNode
 		}
 	} else {
 		net := chains.Network{Name: e.Network, URL: e.URL, Protocol: e.Protocol, HistoryURL: options.HistoryURL, HistoryAPIKey: options.HistoryAPIKey}
 		p, err := chains.EndpointProtocol(net)
 		if err != nil || chains.ValidateNetwork(net) != nil {
-			return Node{}, errInvalidNode
+			return NodeEndpoint{}, errInvalidNode
 		}
 		e.Protocol = p
+	}
+	return e, nil
+}
+func (r *NodeRegistry) insert(ctx context.Context, options NodeOptions, fallback, importing bool) (Node, error) {
+	if options.Purpose == "" {
+		options.Purpose = "general"
+	}
+	if options.Weight == 0 {
+		options.Weight = 1
+	}
+	enabled := options.Enabled == nil || *options.Enabled
+	origin, role := "custom", "regular"
+	if fallback {
+		origin, role = "fallback", "fallback"
+	}
+	e, err := r.validate(options, fallback)
+	if err != nil {
+		return Node{}, err
 	}
 	_, configured := r.configured[e]
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -269,7 +319,7 @@ func (r *NodeRegistry) add(ctx context.Context, options NodeOptions, fallback bo
 	}
 	defer tx.Rollback()
 	// Check aliases as well as exact URLs, including built-in and discovered nodes.
-	rows, err := tx.QueryContext(ctx, "SELECT network,protocol,url,origin FROM rpc_nodes WHERE network=? AND removed=0", e.Network)
+	rows, err := tx.QueryContext(ctx, "SELECT network,protocol,url,origin FROM rpc_nodes WHERE network=? AND (removed=0 OR ?)", e.Network, importing)
 	if err != nil {
 		return Node{}, err
 	}
@@ -280,7 +330,7 @@ func (r *NodeRegistry) add(ctx context.Context, options NodeOptions, fallback bo
 			break
 		}
 		if peer.identity() == e.identity() {
-			if _, current := r.configured[peer]; owner == "config" && !current && !fallback {
+			if _, current := r.configured[peer]; owner == "config" && !current && !fallback && !importing {
 				e = peer
 				continue
 			}
@@ -303,9 +353,9 @@ func (r *NodeRegistry) add(ctx context.Context, options NodeOptions, fallback bo
 		}
 	}
 	var id int64
-	err = tx.QueryRowContext(ctx, `INSERT INTO rpc_nodes(network,protocol,url,api_key,history_url,history_key,origin) VALUES(?,?,?,?,?,?,?)
-	ON CONFLICT(network,protocol,url) DO UPDATE SET api_key=excluded.api_key,history_url=excluded.history_url,history_key=excluded.history_key,generation=generation+1, removed=0, status='untested',height=NULL,checked_at=NULL,latency=NULL,origin=CASE WHEN origin='builtin' AND excluded.origin='custom' THEN origin ELSE excluded.origin END
-	WHERE removed=1 OR (origin='config' AND NOT ?) RETURNING id`, e.Network, e.Protocol, e.URL, options.APIKey, options.HistoryURL, options.HistoryAPIKey, origin, configured).Scan(&id)
+	err = tx.QueryRowContext(ctx, `INSERT INTO rpc_nodes(network,protocol,url,api_key,history_url,history_key,origin,enabled,purpose,weight,role) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(network,protocol,url) DO UPDATE SET enabled=excluded.enabled,purpose=excluded.purpose,weight=excluded.weight,role=excluded.role,managed=0,api_key=excluded.api_key,history_url=excluded.history_url,history_key=excluded.history_key,generation=generation+1, removed=0, status='untested',height=NULL,checked_at=NULL,latency=NULL,origin=CASE WHEN origin='builtin' AND excluded.origin='custom' THEN origin ELSE excluded.origin END
+	WHERE removed=1 OR (origin='config' AND NOT ?) RETURNING id`, e.Network, e.Protocol, e.URL, options.APIKey, options.HistoryURL, options.HistoryAPIKey, origin, enabled, options.Purpose, options.Weight, role, configured).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, errDuplicateNode
 	}
@@ -319,7 +369,8 @@ func (r *NodeRegistry) add(ctx context.Context, options NodeOptions, fallback bo
 	return r.get(ctx, id)
 }
 func (r *NodeRegistry) Delete(ctx context.Context, id int64) error {
-	if _, err := r.get(ctx, id); err != nil {
+	n, err := r.get(ctx, id)
+	if err != nil {
 		return err
 	}
 	res, err := r.db.ExecContext(ctx, `UPDATE rpc_nodes SET removed=1 WHERE id=? AND removed=0`, id)
@@ -330,22 +381,23 @@ func (r *NodeRegistry) Delete(ctx context.Context, id int64) error {
 	if count == 0 {
 		return sql.ErrNoRows
 	}
-	r.revision.Add(1)
+	r.changed(n.Network)
 	return err
 }
 
 // Only the exact configured endpoint gets its operator-supplied credentials and history URL.
 func (r *NodeRegistry) network(n Node, settings chains.Network) chains.Network {
 	src := chains.Network{Name: n.Network, URL: n.URL, Protocol: n.Protocol, APIKey: n.options.APIKey, HistoryURL: n.options.HistoryURL, HistoryAPIKey: n.options.HistoryAPIKey}
-	if configured, ok := r.configured[n.NodeEndpoint]; ok {
+	if configured, ok := r.configured[n.NodeEndpoint]; ok && !n.managed {
 		src = configured
 		src.Protocol = n.Protocol
-	} else if n.Origin == "builtin" && src.HistoryURL == "" {
+	} else if !n.managed && n.Origin == "builtin" && src.HistoryURL == "" {
 		src.HistoryURL = builtinHistory[r.builtins[n.NodeEndpoint]]
 	}
 	src.Confirmations = settings.Confirmations
 	src.Lookback = settings.Lookback
 	src.IntervalSeconds = settings.IntervalSeconds
+	src.AssetEvents = settings.AssetEvents
 	src.TraceCalls = settings.TraceCalls
 	return src
 }
@@ -368,6 +420,9 @@ func (r *NodeRegistry) Test(ctx context.Context, id int64) (Node, error) {
 	if err != nil {
 		return Node{}, err
 	}
+	if !n.Enabled {
+		return Node{}, errDisabledNode
+	}
 	start := time.Now()
 	timeout := 10 * time.Second
 	if n.Protocol == "sse" {
@@ -376,7 +431,7 @@ func (r *NodeRegistry) Test(ctx context.Context, id int64) (Node, error) {
 	probe, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	src := r.network(n, chains.Network{})
-	defer r.lookup.lanes.scan(providerKey(src))()
+	defer r.lookup.lanes.scan(chains.ProviderKey(src))()
 	var height int64
 	if n.Protocol == "toncenter-v3" {
 		height, err = chains.TONIndexHeight(probe, src)
